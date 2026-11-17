@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+dist_installer/
+installer_output/
+*.egg-info/
+.installed.cfg
+*.egg
+*.spec
+
+# PyInstaller / Executables
+*.exe
+!assets/**
+
+# Media and temporary working directories
+output/
+segments/
+temp/
+tmp/
+*.mp4
+*.mkv
+*.mov
+*.wav
+*.mp3
+*.m4a
+*.ass
+*.srt
+*.vtt
+
+# Local configurations and secret keys
+settings.json
+.streamclipper/
+*.key
+*.env
+.env*
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Explicit inclusions
+!requirements.txt
+!build_software.bat
+!installer.iss
+!assets/
+!assets/app_icon.ico
+!assets/app_icon.png
+!assets/icon.ico
