@@ -1635,6 +1635,38 @@ class MainWindow(QMainWindow):
         self._aspect_combo.currentTextChanged.connect(self._on_aspect_changed)
         c1.addWidget(self._aspect_combo)
 
+        # --- 9:16 Layout Mode ---
+        c1.addWidget(self._make_label("9:16 Layout Mode"))
+        self._layout_mode_combo = QComboBox()
+        self._layout_mode_combo.addItems([
+            "Smart Face Center (Single Frame)",
+            "Gaming Split-Screen (Gameplay Top + Facecam Bottom)",
+        ])
+        self._layout_mode_combo.setToolTip(
+            "Smart Face Center: single-frame auto-crop with face tracking.\n"
+            "Gaming Split-Screen: gameplay on top half, facecam on bottom half (9:16 only)."
+        )
+        self._layout_mode_combo.currentTextChanged.connect(self._on_layout_mode_changed)
+        c1.addWidget(self._layout_mode_combo)
+
+        # --- Facecam Corner (visible only in Gaming Split-Screen mode) ---
+        self._facecam_corner_label = self._make_label("Facecam Corner")
+        self._facecam_corner_combo = QComboBox()
+        self._facecam_corner_combo.addItems([
+            "Auto-Detect Facecam",
+            "Bottom-Right",
+            "Bottom-Left",
+            "Top-Right",
+            "Top-Left",
+        ])
+        self._facecam_corner_combo.setToolTip(
+            "Corner of the screen where the streamer's facecam overlay appears."
+        )
+        self._facecam_corner_label.setVisible(False)
+        self._facecam_corner_combo.setVisible(False)
+        c1.addWidget(self._facecam_corner_label)
+        c1.addWidget(self._facecam_corner_combo)
+
         c1.addWidget(self._make_label("Clip Duration"))
         self._dur_combo = QComboBox()
         self._dur_combo.addItems(["60 seconds", "45 seconds", "30 seconds", "15 seconds"])
@@ -1975,11 +2007,17 @@ class MainWindow(QMainWindow):
             "preset": quality_info["preset"],
             "audio_bitrate": quality_info["audio_bitrate"],
             "enable_face_tracking": self._face_tracking_check.isChecked() and "16:9" not in aspect_name,
+            "layout_mode": self._layout_mode_combo.currentText() if hasattr(self, "_layout_mode_combo") else "Smart Face Center (Single Frame)",
+            "facecam_corner": self._facecam_corner_combo.currentText() if hasattr(self, "_facecam_corner_combo") else "Auto-Detect Facecam",
         }
         for k, v in style_overrides.items():
             if k == "margin_v":
                 continue  # Let aspect ratio control vertical margin
             editor_kwargs[k] = v
+
+        # For Gaming Split-Screen, override margin_v so captions sit at the split boundary
+        if editor_kwargs.get("layout_mode") == "Gaming Split-Screen (Gameplay Top + Facecam Bottom)":
+            editor_kwargs["margin_v"] = 740  # subtitle sits just above the split line
 
         base_font_size = int(editor_kwargs.get("font_size", 78))
         editor_kwargs["font_size"] = max(24, int(base_font_size * aspect_info.get("font_scale", 1.0) * scale_factor))
@@ -2025,6 +2063,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Action Handlers
     # ------------------------------------------------------------------
+
+    @Slot(str)
+    def _on_layout_mode_changed(self, text: str) -> None:
+        """Show/hide the Facecam Corner row based on selected layout mode."""
+        is_split = "Gaming Split-Screen" in text
+        self._facecam_corner_label.setVisible(is_split)
+        self._facecam_corner_combo.setVisible(is_split)
 
     @Slot(str)
     def _on_aspect_changed(self, text: str) -> None:
@@ -2226,6 +2271,10 @@ class MainWindow(QMainWindow):
         self._accuracy_combo.setEnabled(False)
         self._style_combo.setEnabled(False)
         self._lang_combo.setEnabled(False)
+        if hasattr(self, "_layout_mode_combo"):
+            self._layout_mode_combo.setEnabled(False)
+        if hasattr(self, "_facecam_corner_combo"):
+            self._facecam_corner_combo.setEnabled(False)
         self._face_tracking_check.setEnabled(False)
         self._browse_btn.setEnabled(False)
 
@@ -2261,6 +2310,10 @@ class MainWindow(QMainWindow):
         self._lang_combo.setEnabled(True)
         self._face_tracking_check.setEnabled("16:9" not in self._aspect_combo.currentText())
         self._browse_btn.setEnabled(True)
+        if hasattr(self, "_layout_mode_combo"):
+            self._layout_mode_combo.setEnabled(True)
+        if hasattr(self, "_facecam_corner_combo"):
+            self._facecam_corner_combo.setEnabled(True)
         self._status_bar.showMessage("Ready")
 
     # ------------------------------------------------------------------

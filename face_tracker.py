@@ -404,3 +404,107 @@ class FaceTracker:
             expr = f"if(lt(t\\,{t1:.2f})\\,{segment}\\,{expr})"
 
         return f"clip({expr}\\,0\\,{max_x})"
+
+
+def detect_facecam_region(
+    video_path: "Path | str",
+    facecam_corner: str = "Auto-Detect Facecam",
+) -> tuple[int, int, int, int]:
+    """Detect the facecam bounding box in a video file.
+
+    Samples ~5 frames from the video and runs face detection restricted to the
+    4 corner regions. Returns ``(x, y, w, h)`` of the best-matched corner crop.
+
+    Falls back to a predefined corner crop when no face is detected or
+    ``facecam_corner`` is an explicit corner name.
+
+    Parameters
+    ----------
+    video_path:
+        Path to the source video file (1920×1080 expected).
+    facecam_corner:
+        ``"Auto-Detect Facecam"`` to run detection, or one of
+        ``"Bottom-Left"``, ``"Bottom-Right"``, ``"Top-Left"``, ``"Top-Right"``
+        to skip detection and use the preset crop directly.
+
+    Returns
+    -------
+    (x, y, w, h)
+        Crop coordinates for the facecam region.
+    """
+    from pathlib import Path as _Path
+
+    video_path = _Path(video_path)
+
+    # Predefined corner crops for a 1920×1080 source
+    _CORNER_CROPS: dict[str, tuple[int, int, int, int]] = {
+        "Bottom-Left":  (0,    600, 550, 480),
+        "Bottom-Right": (1370, 600, 550, 480),
+        "Top-Left":     (0,    0,   550, 480),
+        "Top-Right":    (1370, 0,   550, 480),
+    }
+
+    # If user picked an explicit corner, return it immediately
+    if facecam_corner in _CORNER_CROPS:
+        logger.info("Facecam corner preset: %s → %s", facecam_corner, _CORNER_CROPS[facecam_corner])
+        return _CORNER_CROPS[facecam_corner]
+
+    # --- Auto-detect ---
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.warning("detect_facecam_region: cannot open %s; defaulting to Bottom-Right", video_path)
+            return _CORNER_CROPS["Bottom-Right"]
+
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+        total_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+
+        # Corner ROI definitions scaled to actual video size
+        rw = max(1, int(orig_w * 0.30))
+        rh = max(1, int(orig_h * 0.35))
+        corner_rois: dict[str, tuple[int, int, int, int]] = {
+            "Bottom-Left":  (0,          orig_h - rh, rw, rh),
+            "Bottom-Right": (orig_w - rw, orig_h - rh, rw, rh),
+            "Top-Left":     (0,          0,            rw, rh),
+            "Top-Right":    (orig_w - rw, 0,            rw, rh),
+        }
+
+        # Face detector (Haar cascade fallback — always available with OpenCV)
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+
+        corner_hits: dict[str, int] = {k: 0 for k in corner_rois}
+
+        sample_indices = [int(total_frames * i / 5) for i in range(5)]
+        for fi in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            for corner_name, (cx, cy, cw, ch) in corner_rois.items():
+                roi = gray[cy: cy + ch, cx: cx + cw]
+                faces = face_cascade.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+                if len(faces) > 0:
+                    corner_hits[corner_name] += 1
+
+        cap.release()
+
+        best_corner = max(corner_hits, key=lambda k: corner_hits[k])
+        if corner_hits[best_corner] == 0:
+            logger.info("detect_facecam_region: no face found in any corner; defaulting to Bottom-Right")
+            return _CORNER_CROPS["Bottom-Right"]
+
+        logger.info(
+            "detect_facecam_region: best corner = %s (hits=%d)",
+            best_corner, corner_hits[best_corner],
+        )
+        # Return the standard predefined crop for this corner
+        return _CORNER_CROPS[best_corner]
+
+    except Exception as exc:
+        logger.warning("detect_facecam_region failed (%s); defaulting to Bottom-Right", exc)
+        return _CORNER_CROPS["Bottom-Right"]

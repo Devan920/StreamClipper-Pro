@@ -109,6 +109,8 @@ class EditorConfig:
     background_box_color: str = "&H80000000"
     caption_y_position: float = 0.75
     enable_face_tracking: bool = True  # Smart face tracking for 9:16, 4:5, 1:1
+    layout_mode: str = "Smart Face Center (Single Frame)"
+    facecam_corner: str = "Auto-Detect Facecam"
     quality: str = "1080p Ultra (High Bitrate)"  # "1080p Ultra (High Bitrate)" | "1080p Standard" | "720p Fast"
     crf: int = 17
     preset: str = "medium"

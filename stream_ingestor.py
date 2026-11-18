@@ -414,9 +414,6 @@ class StreamIngestor:
             pass
 
         self._process = None
-            self._process.stderr.close()
-
-        self._process = None
 
 
 class _StreamExtractionError(Exception):

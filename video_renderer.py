@@ -162,7 +162,62 @@ class VideoRenderer:
         target_w = getattr(self._config, "output_width", _DEFAULT_WIDTH)
         target_h = getattr(self._config, "output_height", _DEFAULT_HEIGHT)
         enable_tracking = getattr(self._config, "enable_face_tracking", True)
+        layout_mode = getattr(self._config, "layout_mode", "Smart Face Center (Single Frame)")
+        facecam_corner = getattr(self._config, "facecam_corner", "Auto-Detect Facecam")
 
+        # --- Gaming Split-Screen shortcut ---
+        if layout_mode == "Gaming Split-Screen (Gameplay Top + Facecam Bottom)":
+            # Build ASS subtitles first (we still want captions)
+            clip_words = []
+            if transcript and getattr(transcript, "segments", None):
+                for seg in transcript.segments:
+                    for w in seg.words:
+                        if w.end > start and w.start < end:
+                            clip_words.append(w)
+
+            ass_path_for_split: Path | None = None
+            sub_temp_dir = Path(tempfile.gettempdir()) / "streamclipper_subs"
+            sub_temp_dir.mkdir(parents=True, exist_ok=True)
+
+            if clip_words:
+                ass_content = generate_ass_subtitles(clip_words, self._config, start_offset=start)
+                if ass_content.strip():
+                    sub_filename = f"gss_subs_{uuid.uuid4().hex[:10]}.ass"
+                    ass_path_for_split = sub_temp_dir / sub_filename
+                    ass_path_for_split.write_text(ass_content, encoding="utf-8")
+            else:
+                logger.info("Gaming Split-Screen: no spoken words; rendering without subtitles.")
+
+            try:
+                from face_tracker import detect_facecam_region
+                fc_x, fc_y, fc_w, fc_h = detect_facecam_region(source_path, facecam_corner)
+            except Exception as exc:
+                logger.warning("detect_facecam_region failed (%s); using Bottom-Right default.", exc)
+                fc_x, fc_y, fc_w, fc_h = 1370, 600, 550, 480
+
+            try:
+                return render_gaming_split_screen(
+                    input_path=source_path,
+                    output_path=output_path,
+                    facecam_x=fc_x,
+                    facecam_y=fc_y,
+                    facecam_w=fc_w,
+                    facecam_h=fc_h,
+                    crf=getattr(self._config, "crf", 18),
+                    preset=getattr(self._config, "preset", "medium"),
+                    audio_bitrate=getattr(self._config, "audio_bitrate", "192k"),
+                    start=start,
+                    duration=duration,
+                    ass_path=ass_path_for_split,
+                )
+            finally:
+                if ass_path_for_split and ass_path_for_split.is_file():
+                    try:
+                        ass_path_for_split.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+        # --- Standard single-frame face-tracking pipeline ---
         crop_filter = None
         if enable_tracking:
             try:
@@ -416,6 +471,150 @@ def concat_segments(
         list_file.unlink(missing_ok=True)
 
     return output_path
+
+
+
+def render_gaming_split_screen(
+    input_path: "Path",
+    output_path: "Path",
+    facecam_x: int,
+    facecam_y: int,
+    facecam_w: int,
+    facecam_h: int,
+    crf: int = 18,
+    preset: str = "medium",
+    audio_bitrate: str = "192k",
+    start: float = 0.0,
+    duration: float | None = None,
+    ass_path: "Path | None" = None,
+) -> "Path":
+    """Render a 9:16 Gaming Split-Screen clip (1080×1920).
+
+    Top half (1080×1180): main gameplay cropped from full frame.
+    Bottom half (1080×740): facecam crop+scale from detected corner.
+    4-pixel dark separator between halves.
+    Optional ASS subtitle overlay burned in.
+
+    Parameters
+    ----------
+    input_path:
+        Path to the source video file.
+    output_path:
+        Desired output file path (.mp4).
+    facecam_x, facecam_y, facecam_w, facecam_h:
+        Facecam crop region in source pixel coordinates.
+    crf:
+        x264 CRF quality (default 18).
+    preset:
+        x264 preset (default "medium").
+    audio_bitrate:
+        AAC audio bitrate (default "192k").
+    start:
+        Start time offset in seconds.
+    duration:
+        Clip duration in seconds (None = full file).
+    ass_path:
+        Optional path to an ASS subtitle file to burn in.
+
+    Returns
+    -------
+    Path
+        Absolute path to the rendered output file.
+    """
+    input_path = Path(input_path).resolve()
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ffmpeg_bin = _resolve_binary("ffmpeg")
+
+    # Build filter_complex:
+    # - [top]: full frame crop to 1080-wide by 1180-tall (gameplay), + 4px black pad at bottom
+    # - [bottom]: facecam crop region, scale to 1080×736, + 4px black pad at top
+    # - vstack both halves to produce 1080×1920
+    fc_x = max(0, facecam_x)
+    fc_y = max(0, facecam_y)
+    fc_w = max(2, facecam_w - (facecam_w % 2))
+    fc_h = max(2, facecam_h - (facecam_h % 2))
+
+    filter_complex = (
+        f"[0:v]crop=1920:1080:0:0,scale=1080:1180,pad=1080:1184:0:0:color=black[top];"
+        f"[0:v]crop={fc_w}:{fc_h}:{fc_x}:{fc_y},scale=1080:736,pad=1080:740:0:4:color=black[bot];"
+        f"[top][bot]vstack=inputs=2[stacked]"
+    )
+
+    # Determine final video filter (with or without subtitles)
+    final_vf_node = "[stacked]"
+    sub_filter_part = ""
+    ass_tmp_name: str | None = None
+    sub_tmp_dir: Path | None = None
+
+    if ass_path is not None and Path(ass_path).is_file() and Path(ass_path).stat().st_size > 10:
+        # Use cwd trick: copy/symlink to temp dir and reference by basename to avoid Windows path issues
+        sub_tmp_dir = Path(tempfile.gettempdir()) / "streamclipper_subs"
+        sub_tmp_dir.mkdir(parents=True, exist_ok=True)
+        ass_tmp_name = f"gss_{uuid.uuid4().hex[:10]}.ass"
+        import shutil as _shutil
+        _shutil.copy2(str(ass_path), str(sub_tmp_dir / ass_tmp_name))
+        # Append subtitle filter to filter_complex chain
+        filter_complex += f";[stacked]ass='{ass_tmp_name}'[out]"
+        final_vf_node = "[out]"
+    else:
+        filter_complex += f";[stacked]copy[out]"
+        final_vf_node = "[out]"
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(input_path),
+    ]
+    if duration is not None and duration > 0:
+        cmd += ["-t", f"{duration:.3f}"]
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", final_vf_node,
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    cwd = str(sub_tmp_dir) if sub_tmp_dir else str(output_path.parent)
+    logger.debug("render_gaming_split_screen ffmpeg cmd: %s", " ".join(cmd))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            **get_subprocess_kwargs(),
+        )
+        if result.returncode != 0:
+            stderr_text = result.stderr or ""
+            lines = [l.strip() for l in stderr_text.splitlines() if l.strip()]
+            err_summary = "\n".join(lines[-10:]) if lines else "Unknown FFmpeg error"
+            logger.error("render_gaming_split_screen FFmpeg failed (code %d):\n%s", result.returncode, err_summary)
+            raise RuntimeError(
+                f"render_gaming_split_screen: FFmpeg exited {result.returncode}:\n{err_summary}"
+            )
+        logger.info("Gaming split-screen clip rendered to %s", output_path)
+        return output_path
+    finally:
+        # Clean up temp ASS copy
+        if sub_tmp_dir and ass_tmp_name:
+            tmp_ass = sub_tmp_dir / ass_tmp_name
+            try:
+                tmp_ass.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # Backward-compatible aliases
