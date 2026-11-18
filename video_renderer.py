@@ -374,7 +374,7 @@ def concat_segments(
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if len(segment_paths) == 1:
+    if len(segment_paths) == 1 and segment_paths[0].suffix.lower() == output_path.suffix.lower():
         shutil.copy2(segment_paths[0], output_path)
         return output_path
 
@@ -394,6 +394,8 @@ def concat_segments(
         "-i", str(list_file.resolve()),
         "-c", "copy",
     ]
+    if output_path.suffix.lower() == ".mp4":
+        cmd.extend(["-movflags", "+faststart"])
     if max_duration and max_duration > 0:
         cmd.extend(["-t", f"{max_duration:.3f}"])
     cmd.append(str(output_path))
@@ -416,5 +418,6 @@ def concat_segments(
     return output_path
 
 
-# Backward-compatible alias
+# Backward-compatible aliases
 VideoEditor = VideoRenderer
+resolve_binary = _resolve_binary

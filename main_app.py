@@ -110,6 +110,9 @@ from config import (
     IngestorConfig,
     PipelineConfig,
     TranscriberConfig,
+    get_app_data_dir,
+    get_default_output_dir,
+    get_segments_dir,
 )
 from vod_processor import (
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -181,9 +184,9 @@ QUALITY_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
-SETTINGS_DIR = Path.home() / ".streamclipper"
+SETTINGS_DIR = get_app_data_dir()
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
-DEFAULT_OUTPUT_DIR = Path.home() / "Videos" / "StreamClipperPro"
+DEFAULT_OUTPUT_DIR = get_default_output_dir()
 
 
 def _load_settings() -> dict[str, Any]:
@@ -192,6 +195,14 @@ def _load_settings() -> dict[str, Any]:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             if not data.get("gemini_api_key"):
                 data["gemini_api_key"] = DEFAULT_GEMINI_API_KEY
+            return data
+        # Fallback to legacy path if it exists
+        legacy = Path.home() / ".streamclipper" / "settings.json"
+        if legacy.is_file():
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            if not data.get("gemini_api_key"):
+                data["gemini_api_key"] = DEFAULT_GEMINI_API_KEY
+            _save_settings(data)
             return data
     except Exception:
         pass
@@ -737,7 +748,11 @@ class PipelineWorker(QThread):
         self.status_changed.emit("buffering")
         self.log_message.emit("Starting live stream monitoring…", "INFO")
 
-        ingestor = StreamIngestor(self._url, self._config.ingestor)
+        ingestor = StreamIngestor(
+            self._url,
+            self._config.ingestor,
+            log_callback=lambda msg, lvl: self.log_message.emit(msg, lvl),
+        )
         detector = HypeDetector(self._config.hype)
         transcriber = Transcriber(self._config.transcriber)
         editor = VideoEditor(self._config.editor)
@@ -1464,12 +1479,17 @@ class MainWindow(QMainWindow):
         # --- Settings & Output Directory ---
         settings = _load_settings()
         saved_folder = settings.get("output_folder")
-        if saved_folder and Path(saved_folder).is_dir():
+        if (
+            saved_folder
+            and Path(saved_folder).is_dir()
+            and "Program Files" not in str(saved_folder)
+        ):
             self._output_dir = Path(saved_folder)
         else:
             self._output_dir = DEFAULT_OUTPUT_DIR
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
+            get_segments_dir().mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
 
@@ -1979,7 +1999,8 @@ class MainWindow(QMainWindow):
         config = PipelineConfig(
             ingestor=IngestorConfig(
                 segment_duration=10 if clip_interval_sec > 0 else clip_dur,
-                output_dir=app_dir / "segments",
+                output_dir=get_segments_dir(),
+                format="ts",
             ),
             hype=HypeConfig(
                 clip_duration=clip_dur,

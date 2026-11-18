@@ -1,5 +1,6 @@
 """Central configuration for the Stream Clipper pipeline."""
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 import logging
@@ -8,14 +9,39 @@ import logging
 DEFAULT_GEMINI_API_KEY: str = ""
 
 
+def get_app_data_dir() -> Path:
+    """Return %LOCALAPPDATA%/StreamClipperPro (or ~/.streamclipper on non-Windows)."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        p = Path(local_app_data) / "StreamClipperPro"
+    else:
+        p = Path.home() / ".streamclipper"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_segments_dir() -> Path:
+    """Return %LOCALAPPDATA%/StreamClipperPro/segments."""
+    p = get_app_data_dir() / "segments"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_default_output_dir() -> Path:
+    """Return %USERPROFILE%/Videos/StreamClipper Pro."""
+    p = Path.home() / "Videos" / "StreamClipper Pro"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 @dataclass
 class IngestorConfig:
     """Configuration for the stream ingestor module."""
 
     segment_duration: int = 10  # 10s rolling recording chunks for sliding window
     max_segments: int = 60  # keep last 60 segments (~10 min rolling buffer)
-    output_dir: Path = field(default_factory=lambda: Path("segments"))
-    format: str = "mp4"
+    output_dir: Path = field(default_factory=get_segments_dir)
+    format: str = "ts"  # MPEG-TS (.ts) segments for robust live streaming
     video_quality: str = "bestvideo[height<=1080]+bestaudio/best[height<=1080][protocol^=m3u8]/best[protocol^=m3u8]/best"  # Prefer up to 1080p
     ffmpeg_loglevel: str = "warning"
 
@@ -60,7 +86,7 @@ class TranscriberConfig:
 class EditorConfig:
     """Configuration for the video editor module."""
 
-    output_dir: Path = field(default_factory=lambda: Path("output"))
+    output_dir: Path = field(default_factory=get_default_output_dir)
     aspect_ratio: tuple[int, int] = (9, 16)
     aspect_ratio_name: str = "9:16 (Shorts / Reels)"
     output_width: int = 1080

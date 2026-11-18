@@ -18,7 +18,8 @@ from typing import Any, AsyncGenerator
 
 import yt_dlp  # type: ignore[import-untyped]
 
-from config import IngestorConfig
+from config import IngestorConfig, get_segments_dir
+from video_renderer import _resolve_binary, get_subprocess_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,8 @@ class StreamIngestor:
     """Ingests a live stream into rolling fixed-duration segments.
 
     Uses yt-dlp to resolve the direct stream URL and ffmpeg's ``-f segment``
-    muxer to split the recording into sequential MP4 files.  Old segments
-    beyond *max_segments* are automatically deleted.
+    muxer to split the recording into sequential MPEG-TS (.ts) or MP4 files.
+    Old segments beyond *max_segments* are automatically deleted.
 
     Parameters
     ----------
@@ -40,15 +41,39 @@ class StreamIngestor:
         YouTube (or yt-dlp–compatible) live stream URL.
     config:
         Ingestor-specific configuration dataclass.
+    log_callback:
+        Optional callback for forwarding log lines to the UI (message, level).
     """
 
-    def __init__(self, url: str, config: IngestorConfig | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        config: IngestorConfig | None = None,
+        log_callback: Any = None,
+    ) -> None:
         self._url = url
         self._config = config or IngestorConfig()
+        self._log_callback = log_callback
         self._process: subprocess.Popen[bytes] | None = None
         self._stop_event = asyncio.Event()
         self._segments: deque[Path] = deque()
         self._lock = threading.Lock()
+
+    def _log(self, message: str, level: str = "INFO") -> None:
+        if level == "ERROR":
+            logger.error(message)
+        elif level == "WARNING":
+            logger.warning(message)
+        elif level == "DEBUG":
+            logger.debug(message)
+        else:
+            logger.info(message)
+
+        if self._log_callback:
+            try:
+                self._log_callback(message, level)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Public API
@@ -218,40 +243,77 @@ class StreamIngestor:
         subprocess.Popen
             The running ffmpeg process.
         """
+        fmt = (self._config.format or "ts").lower()
+        if fmt in ("ts", "mpegts"):
+            ext = "ts"
+            segment_format = "mpegts"
+        else:
+            ext = fmt
+            segment_format = fmt
+
         output_pattern = str(
-            self._config.output_dir / "seg_%Y%m%d_%H%M%S.mp4"
+            self._config.output_dir / f"seg_%Y%m%d_%H%M%S.{ext}"
         )
 
+        ffmpeg_bin = _resolve_binary("ffmpeg")
+
         cmd: list[str] = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-loglevel", self._config.ffmpeg_loglevel,
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-i", stream_url,
             "-c", "copy",
             "-f", "segment",
             "-segment_time", str(self._config.segment_duration),
-            "-segment_format", self._config.format,
+            "-segment_format", segment_format,
             "-reset_timestamps", "1",
             "-strftime", "1",
             output_pattern,
         ]
 
-        logger.info("Spawning ffmpeg: %s", " ".join(cmd))
+        self._log(
+            f"🎬 Ingest recording: {self._config.segment_duration}s .{ext} chunks -> {self._config.output_dir}",
+            "INFO",
+        )
+        logger.debug("Spawning ffmpeg: %s", " ".join(cmd))
 
-        kw: dict[str, Any] = {}
-        if sys.platform == "win32":
-            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 0
-            kw["startupinfo"] = startupinfo
-
+        kw = get_subprocess_kwargs()
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             **kw,
         )
-        logger.info("ffmpeg started with PID %d.", process.pid)
+        self._log(f"FFmpeg ingest started (PID {process.pid})", "DEBUG")
+
+        # Daemon thread to forward stderr lines directly to the UI live log
+        def _read_stderr() -> None:
+            if process.stderr is None:
+                return
+            try:
+                for raw_line in iter(process.stderr.readline, b""):
+                    if not raw_line or self._stop_event.is_set():
+                        break
+                    line = raw_line.decode(errors="replace").strip()
+                    if not line:
+                        continue
+                    lower = line.lower()
+                    if any(err in lower for err in [
+                        "error", "invalid", "fatal", "failed", "could not",
+                        "permission denied", "access is denied", "no such file",
+                    ]):
+                        self._log(f"⚠️ [FFmpeg] {line}", "ERROR")
+                    elif any(warn in lower for warn in ["warning", "drop", "corrupt", "reconnect"]):
+                        self._log(f"[FFmpeg] {line}", "WARNING")
+                    else:
+                        logger.debug("[FFmpeg] %s", line)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
         return process
 
     async def _watch_segments(self) -> AsyncGenerator[Path, None]:
@@ -265,26 +327,32 @@ class StreamIngestor:
         Path
             Absolute path to each completed segment.
         """
+        fmt = (self._config.format or "ts").lower()
+        ext = "ts" if fmt in ("ts", "mpegts") else fmt
+        pattern = f"*.{ext}"
+
         seen: set[str] = {
-            p.name for p in self._config.output_dir.glob(f"*.{self._config.format}")
+            p.name for p in self._config.output_dir.glob(pattern)
         }
         pending: Path | None = None
 
         while not self._stop_event.is_set():
             # Check if ffmpeg is still alive.
             if self._process is not None and self._process.poll() is not None:
-                logger.warning(
-                    "ffmpeg exited with code %d.", self._process.returncode or -1
-                )
-                # Yield the last pending segment if any.
-                if pending is not None and pending.exists():
+                ret = self._process.returncode or 0
+                if ret != 0:
+                    self._log(f"⚠️ FFmpeg ingest exited with code {ret}.", "ERROR")
+                else:
+                    self._log(f"FFmpeg ingest completed with code {ret}.", "INFO")
+                # Yield the last pending segment if any and non-empty.
+                if pending is not None and pending.exists() and pending.stat().st_size > 0:
                     yield pending
                     self._track_segment(pending)
                     pending = None
                 return
 
             current_files = sorted(
-                self._config.output_dir.glob(f"*.{self._config.format}"),
+                self._config.output_dir.glob(pattern),
                 key=lambda p: p.stat().st_mtime,
             )
             new_files = [f for f in current_files if f.name not in seen]
@@ -293,8 +361,8 @@ class StreamIngestor:
                 seen.add(new_file.name)
                 # The previously pending file is now complete because
                 # ffmpeg has started writing a new one.
-                if pending is not None and pending.exists():
-                    logger.info("Segment complete: %s", pending.name)
+                if pending is not None and pending.exists() and pending.stat().st_size > 0:
+                    self._log(f"Segment complete: {pending.name} ({pending.stat().st_size / 1e6:.2f} MB)", "DEBUG")
                     yield pending
                     self._track_segment(pending)
                 pending = new_file
@@ -328,21 +396,24 @@ class StreamIngestor:
 
         if self._process.poll() is None:
             logger.info("Terminating ffmpeg (PID %d).", self._process.pid)
-            self._process.terminate()
             try:
-                self._process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                logger.warning("ffmpeg did not exit in time — killing.")
-                self._process.kill()
+                self._process.terminate()
                 self._process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, Exception):
+                logger.warning("ffmpeg did not exit in time — killing.")
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=3)
+                except Exception:
+                    pass
 
-        # Log any stderr output for debugging.
-        if self._process.stderr is not None:
-            stderr_output = self._process.stderr.read()
-            if stderr_output:
-                logger.debug(
-                    "ffmpeg stderr:\n%s", stderr_output.decode(errors="replace")
-                )
+        try:
+            if self._process.stderr is not None:
+                self._process.stderr.close()
+        except Exception:
+            pass
+
+        self._process = None
             self._process.stderr.close()
 
         self._process = None
